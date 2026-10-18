@@ -85,7 +85,7 @@ fn control_request(
     Ok(request)
 }
 
-/// Matches the server's `PrewarmedSandboxPreparation` contract for setup that does not need a task.
+/// Defines setup that does not need a task.
 #[derive(Clone)]
 pub struct PrewarmedSandboxPreparation {
     pub harness: String,
@@ -140,9 +140,9 @@ impl TryFrom<GraphqlConfiguration> for PrewarmedSandboxConfiguration {
     type Error = anyhow::Error;
 
     fn try_from(config: GraphqlConfiguration) -> Result<Self> {
-        let preparation = config.preparation;
+        let preparation = config.spec;
         Ok(Self {
-            generation: config.generation,
+            generation: config.fingerprint,
             preparation: PrewarmedSandboxPreparation {
                 harness: preparation.harness,
                 repositories: preparation.repositories,
@@ -418,15 +418,9 @@ impl ServerApi {
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 impl PrewarmedSandboxClient for ServerApi {
     async fn fetch_configuration(&self, sandbox_id: &str) -> Result<PrewarmedSandboxConfiguration> {
-        let workload_token = self
-            .base_client
-            .get_or_create_ambient_workload_token()
-            .await?
-            .context("A pre-warmed sandbox request requires a workload token")?;
         let operation = PrewarmedSandboxConfig::build(PrewarmedSandboxConfigVariables {
             input: PrewarmedSandboxConfigInput {
                 sandbox_id: sandbox_id.into(),
-                workload_token,
             },
             request_context: get_request_context(),
         });
