@@ -170,7 +170,7 @@ fn verify_standby_bootstrap() {
             "test-workload-token",
         )
         .match_body(Matcher::Json(json!({
-            "generation": "bootstrap-generation",
+            "fingerprint": "bootstrap-generation",
             "state": "ready",
             "manifest_hash": "bootstrap-generation"
         })))

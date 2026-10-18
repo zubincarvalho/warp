@@ -15,6 +15,34 @@ const CONFIGURATION_JSON: &str = include_str!(
     "../../../../crates/graphql/src/api/mutations/fixtures/prewarmed_sandbox_config.json"
 );
 
+#[test]
+#[cfg(not(target_family = "wasm"))]
+fn control_unavailable_recognizes_native_handshake_410() {
+    for status in [410, 403, 503] {
+        let response = websocket::tungstenite::http::Response::builder()
+            .status(status)
+            .body(None)
+            .unwrap();
+        let error = anyhow::Error::new(websocket::tungstenite::Error::Http(response))
+            .context("control handshake failed");
+        assert_eq!(is_prewarmed_sandbox_unavailable(&error), status == 410);
+    }
+}
+
+#[test]
+#[cfg(not(target_family = "wasm"))]
+fn native_control_headers_are_sensitive() {
+    let request =
+        control_request("ws://localhost/control", "access-marker", "workload-marker").unwrap();
+    for name in ["authorization", PREWARMED_SANDBOX_WORKLOAD_TOKEN_HEADER] {
+        assert!(request.headers()[name].is_sensitive());
+    }
+    for debug in [format!("{request:?}"), format!("{request:#?}")] {
+        assert!(!debug.contains("access-marker"));
+        assert!(!debug.contains("workload-marker"));
+    }
+}
+
 fn wire_configuration() -> GraphqlConfiguration {
     let response: cynic::GraphQlResponse<PrewarmedSandboxConfig> =
         serde_json::from_str(CONFIGURATION_JSON).unwrap();
@@ -300,30 +328,69 @@ fn configuration_debug_redacts_credentials_and_raw_preparation_values() {
 }
 
 #[test]
-fn ready_status_sends_the_generation_as_the_manifest_hash() {
+fn ready_status_sends_the_generation_as_fingerprint_and_manifest_hash() {
     let ready = PrewarmedSandboxStatusInput {
-        generation: "abc123".to_string(),
+        fingerprint: "abc123".to_string(),
         state: PrewarmedSandboxState::Ready.as_wire_value(),
         manifest_hash: Some("abc123".to_string()),
     };
     assert_eq!(
         serde_json::to_value(&ready).unwrap(),
         serde_json::json!({
-            "generation": "abc123",
+            "fingerprint": "abc123",
             "state": "ready",
             "manifest_hash": "abc123",
         })
     );
 
     let failed = PrewarmedSandboxStatusInput {
-        generation: "abc123".to_string(),
+        fingerprint: "abc123".to_string(),
         state: PrewarmedSandboxState::Failed.as_wire_value(),
         manifest_hash: None,
     };
     assert_eq!(
         serde_json::to_value(&failed).unwrap(),
-        serde_json::json!({ "generation": "abc123", "state": "failed" })
+        serde_json::json!({ "fingerprint": "abc123", "state": "failed" })
     );
+}
+
+#[test]
+fn heartbeat_is_the_only_sandbox_message() {
+    assert_eq!(
+        serde_json::to_value(PrewarmedSandboxControlRequest::Heartbeat {
+            generation: "abc123"
+        })
+        .unwrap(),
+        serde_json::json!({ "type": "heartbeat", "generation": "abc123" })
+    );
+}
+
+#[test]
+fn decodes_retirement_with_and_without_a_reason() {
+    for (message, expected) in [
+        (
+            r#"{"type":"retired","reason":"unavailable"}"#,
+            Some("unavailable"),
+        ),
+        (r#"{"type":"retired"}"#, None),
+    ] {
+        let event: PrewarmedSandboxControlEvent = serde_json::from_str(message).unwrap();
+        let PrewarmedSandboxControlEvent::Retired { reason } = event else {
+            panic!("expected retirement");
+        };
+        assert_eq!(reason.as_deref(), expected);
+    }
+}
+
+/// The server never sends these, so decoding one means the client is talking to an older server.
+#[test]
+fn rejects_handshake_messages_the_server_no_longer_sends() {
+    for message in [
+        r#"{"type":"offer","assignment_id":"a"}"#,
+        r#"{"type":"activated","assignment_id":"a"}"#,
+    ] {
+        assert!(serde_json::from_str::<PrewarmedSandboxControlEvent>(message).is_err());
+    }
 }
 
 #[test]
@@ -349,6 +416,96 @@ fn request_deadline_preserves_completed_results() {
     }))
     .unwrap_err();
     assert_eq!(error.to_string(), "credential failure");
+}
+
+#[test]
+fn fresh_assignment_fixture_decodes_nullable_control_fields() {
+    let fixture = include_str!("testdata/prewarmed_assignment_fresh_run.json");
+    let event: PrewarmedSandboxControlEvent = serde_json::from_str(fixture).unwrap();
+    let PrewarmedSandboxControlEvent::Assignment {
+        assignment_id,
+        generation,
+        execution_config,
+        runtime_env,
+        api_key,
+        expires_at,
+    } = event
+    else {
+        panic!("expected assignment event");
+    };
+    assert_eq!(assignment_id, "assign-123");
+    assert_eq!(generation, "generation-abc");
+    assert_eq!(
+        execution_config.task_id.inner(),
+        "550e8400-e29b-41d4-a716-446655440000"
+    );
+    assert_eq!(execution_config.mcp_servers_json, "{}");
+    assert_eq!(runtime_env["WARP_SANDBOX_DEADLINE"], "1767225600");
+    assert!(execution_config.conversation_id.is_none());
+    assert!(execution_config.parent_run_id.is_none());
+    assert!(execution_config.reasoning_level.is_none());
+    assert!(execution_config.profile_id.is_none());
+    assert!(execution_config.computer_use_model_id.is_none());
+    assert!(execution_config.idle_on_complete_seconds.is_none());
+    assert!(execution_config.idle_on_fail_seconds.is_none());
+    assert!(execution_config.skills.is_empty());
+    assert!(execution_config.factory_skill_dirs.is_empty());
+    assert!(execution_config.setup_commands.is_empty());
+    assert!(execution_config.repositories[0].ref_.is_none());
+    assert!(execution_config.repositories[0].clone_from.is_none());
+    assert!(execution_config.repositories[0].expected_sha.is_none());
+    assert!(execution_config.session_sharing_acls[0].email.is_none());
+    assert!(
+        execution_config
+            .inference_providers
+            .as_ref()
+            .unwrap()
+            .aws_bedrock
+            .as_ref()
+            .unwrap()
+            .region
+            .is_none()
+    );
+    let providers = execution_config.providers.as_ref().unwrap();
+    assert!(providers.aws.is_none());
+    assert!(
+        providers
+            .gcp
+            .as_ref()
+            .unwrap()
+            .service_account_email
+            .is_none()
+    );
+    assert_eq!(api_key, "wk-placeholder-not-a-real-key");
+    assert_eq!(expires_at.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+}
+
+#[test]
+fn assignment_debug_omits_run_credentials_and_embedded_config_values() {
+    let mut event: PrewarmedSandboxControlEvent =
+        serde_json::from_str(include_str!("testdata/prewarmed_assignment_fresh_run.json")).unwrap();
+    if let PrewarmedSandboxControlEvent::Assignment {
+        api_key,
+        runtime_env,
+        execution_config,
+        ..
+    } = &mut event
+    {
+        *api_key = "assignment-key-marker".into();
+        runtime_env.insert("SECRET".into(), "assignment-env-marker".into());
+        execution_config.mcp_servers_json = "assignment-mcp-marker".into();
+        execution_config.setup_commands = vec!["assignment-setup-marker".into()];
+    }
+    for debug in [format!("{event:?}"), format!("{event:#?}")] {
+        for marker in [
+            "assignment-key-marker",
+            "assignment-env-marker",
+            "assignment-mcp-marker",
+            "assignment-setup-marker",
+        ] {
+            assert!(!debug.contains(marker));
+        }
+    }
 }
 
 #[cfg(not(feature = "skip_login"))]
@@ -404,18 +561,8 @@ fn all_endpoints_use_cached_credentials_and_expected_payloads() {
             "test-workload-token",
         )
         .match_body(Matcher::Json(serde_json::json!({
-            "generation": "abc123", "state": "ready", "manifest_hash": "abc123",
+            "fingerprint": "abc123", "state": "ready", "manifest_hash": "abc123",
         })))
-        .with_status(204)
-        .create();
-    let heartbeat = server
-        .mock("POST", "/internal/prewarmed-sandboxes/sandbox/heartbeat")
-        .match_header("authorization", "Bearer test-access-token")
-        .match_header(
-            PREWARMED_SANDBOX_WORKLOAD_TOKEN_HEADER,
-            "test-workload-token",
-        )
-        .match_body(Matcher::Json(serde_json::json!({"generation": "abc123"})))
         .with_status(204)
         .create();
     drop(server);
@@ -427,11 +574,9 @@ fn all_endpoints_use_cached_credentials_and_expected_payloads() {
         api.report_status("sandbox", "abc123", PrewarmedSandboxState::Ready)
             .await
             .unwrap();
-        api.heartbeat("sandbox", "abc123").await.unwrap();
     });
     config.assert();
     status.assert();
-    heartbeat.assert();
 }
 
 #[test]
@@ -449,7 +594,7 @@ fn request_debug_redacts_both_credentials() {
     }));
     let mut server = ChannelState::mock_server();
     let request = server
-        .mock("POST", "/internal/prewarmed-sandboxes/sandbox/heartbeat")
+        .mock("POST", "/internal/prewarmed-sandboxes/sandbox/status")
         .match_header("authorization", "Bearer test-access-token")
         .match_header(
             PREWARMED_SANDBOX_WORKLOAD_TOKEN_HEADER,
@@ -459,7 +604,7 @@ fn request_debug_redacts_both_credentials() {
         .expect(1)
         .create();
     drop(server);
-    let url = ServerApi::prewarmed_sandbox_url("sandbox", "heartbeat");
+    let url = ServerApi::prewarmed_sandbox_url("sandbox", "status");
 
     block_on(async {
         let response = api
@@ -480,7 +625,8 @@ fn rejects_requests_without_access_credentials() {
     let api = ServerApi::new_for_test();
     api.base_client
         .set_ambient_workload_token_for_test("test-workload-token".to_string(), None);
-    let error = block_on(api.heartbeat("sandbox", "abc123")).unwrap_err();
+    let error =
+        block_on(api.report_status("sandbox", "abc123", PrewarmedSandboxState::Ready)).unwrap_err();
     assert!(
         error.to_string().contains("requires an access token"),
         "{error:#}"
