@@ -239,7 +239,7 @@ fn environment_snapshot(
 }
 
 /// Holds shared workspace inputs for normal run setup and standby preparation.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct WorkspaceConfiguration {
     pub source_repos: Vec<SourceRepo>,
     pub deferred_repos: Vec<ResolvedRepository>,
@@ -305,6 +305,12 @@ impl WorkspaceConfiguration {
         policy.validate()?;
         self.preparation_policy = Some(policy);
         Ok(())
+    }
+
+    pub(super) fn same_preparation(&self, other: &Self) -> bool {
+        self.source_repos == other.source_repos
+            && self.setup_commands == other.setup_commands
+            && self.clone_requests == other.clone_requests
     }
 
     /// Reports whether the workspace requires setup before harness startup.
@@ -903,7 +909,7 @@ fn preparation_override_for_repo<'a>(
         .find(|preparation_override| preparation_override_matches_repo(preparation_override, repo))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RepositoryCloneRequest {
     pub(super) remote: SourceRepo,
     pub(super) checkout_name: String,

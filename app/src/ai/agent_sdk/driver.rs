@@ -901,6 +901,22 @@ fn split_run_options(
     ))
 }
 
+/// The workspace setup a standby sandbox completed before its assignment arrived.
+pub(crate) struct StandbyWorkspace {
+    /// What was prepared. An assignment is accepted only when its own workspace matches this.
+    pub configuration: environment::WorkspaceConfiguration,
+    /// Repositories to scan for skills, carried over from the preparation.
+    pub repositories: Vec<crate::ai::cloud_environments::SourceRepo>,
+}
+
+/// A run's workspace, before or after setup.
+pub(crate) enum WorkspaceState {
+    /// Set up when the run starts.
+    Pending(environment::WorkspaceConfiguration),
+    /// Set up ahead of time by a standby sandbox, so the run skips preparation entirely.
+    Prepared(StandbyWorkspace),
+}
+
 /// Owns a headless terminal for agent runs or standby resource preparation.
 pub struct AgentDriver {
     terminal_driver: ModelHandle<terminal::TerminalDriver>,
@@ -967,7 +983,8 @@ pub struct AgentDriver {
     /// Cloud providers set up within this driver session.
     cloud_providers: Vec<Box<dyn cloud_provider::CloudProvider>>,
 
-    workspace: Option<environment::WorkspaceConfiguration>,
+    /// The run's workspace, taken once when setup starts and `None` from then on.
+    workspace: Option<WorkspaceState>,
     skill_dirs: Vec<PathBuf>,
     factory_repository_contract: bool,
     computer_use_configured: bool,
@@ -1419,7 +1436,9 @@ impl AgentDriver {
             restored_conversation_id: None,
             resume_payload: None,
             cloud_providers: Vec::new(),
-            workspace: Some(environment::WorkspaceConfiguration::default()),
+            workspace: Some(WorkspaceState::Pending(
+                environment::WorkspaceConfiguration::default(),
+            )),
             skill_dirs: parse_skills_dirs_env(),
             factory_repository_contract: false,
             computer_use_configured: false,
@@ -1486,7 +1505,12 @@ impl AgentDriver {
         self.restored_conversation_id = restored_conversation_id;
         self.resume_payload = resume_payload;
         self.cloud_providers = cloud_providers;
-        self.workspace = Some(workspace);
+        // A standby sandbox already prepared its workspace, and an assignment is accepted only
+        // after `same_preparation` confirms it matches, so those results stand.
+        self.workspace = match self.workspace.take() {
+            prepared @ Some(WorkspaceState::Prepared(_)) => prepared,
+            _ => Some(WorkspaceState::Pending(workspace)),
+        };
         self.skill_dirs = skill_dirs;
         self.third_party_harness_model_config = third_party_harness_model_config;
         self.team_scope = team_scope;
@@ -2137,9 +2161,6 @@ impl AgentDriver {
             // terminal's cwd into a single environment repo.
             // We do this for all harnesses, so that the skills *may* be discovered by third-party
             // harnesses if appropriate.
-            let global_skill_resolution =
-                agent_setup::prepare_global_skills(&foreground, &setup_events).await?;
-
             let (workspace, factory_repository_contract, session_shell_type) = foreground
                 .spawn(|me, ctx| {
                     (
@@ -2151,77 +2172,101 @@ impl AgentDriver {
                     )
                 })
                 .await?;
-            let mut workspace = workspace.ok_or(AgentDriverError::InvalidRuntimeState)?;
-            let source_repos = workspace.source_repos.clone();
-            // The Factory definition checkout is run-scoped: the dispatch decides
-            // whether this run gets one by attaching the clone variables,
-            // independent of which environment the run executes in.
-            environment::prepend_factory_definition_clone(
-                &mut workspace.setup_commands,
-                session_shell_type,
-            );
-
-            let cloud_env_mcp_scan = if workspace.needs_preparation() {
-                // Subscribe to file-based MCP discovery BEFORE prepare_environment triggers the
-                // pipeline so no CloudEnvMcpScanComplete events are missed.
-                //
-                // File-based MCP discovery is Oz-only.
-                // TODO(REMOTE-1345): handle MCP setup for third-party harnesses.
-                match &task.harness {
-                    HarnessKind::Oz => {
-                        let source_repos = source_repos.clone();
-                        Some(
-                            foreground
-                                .spawn(move |me, ctx| {
-                                    let expected_repo_paths: Vec<PathBuf> = source_repos
-                                        .iter()
-                                        .map(|repo| me.working_dir.join(&repo.repo))
-                                        .collect();
-                                    me.wait_for_cloud_env_file_based_mcp_scan(
-                                        expected_repo_paths,
-                                        MCP_SERVER_STARTUP_TIMEOUT,
-                                        ctx,
-                                    )
-                                })
-                                .await?,
-                        )
-                    }
-                    HarnessKind::ThirdParty(_) | HarnessKind::Unsupported(_) => None,
-                }
-            } else {
-                None
-            };
-            let prepared_workspace = match agent_setup::prepare_workspace(
-                &foreground,
-                task.harness.harness(),
-                workspace,
-                &setup_events,
-                environment_snapshot_reporter,
-            )
-            .await
+            let (global_skill_resolution, prepared_workspace) = match workspace
+                .ok_or(AgentDriverError::InvalidRuntimeState)?
             {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    // Preserve the terminal session when environment setup fails.
-                    Self::linger_after_failure(&foreground, "environment_setup", &error).await;
-                    return Err(error);
+                // A standby sandbox already cloned the repositories and ran the setup
+                // commands, so the run resumes from those results.
+                WorkspaceState::Prepared(prepared) => {
+                    let global_skill_resolution =
+                        agent_setup::resolve_global_skills(&foreground).await?;
+                    let harness_working_dir = foreground
+                        .spawn(|me, _| me.harness_working_dir.clone())
+                        .await?;
+                    (
+                        global_skill_resolution,
+                        agent_setup::PreparedWorkspace {
+                            harness_working_dir,
+                            repositories: prepared.repositories,
+                        },
+                    )
+                }
+                WorkspaceState::Pending(mut workspace) => {
+                    let global_skill_resolution =
+                        agent_setup::prepare_global_skills(&foreground, &setup_events).await?;
+                    // The Factory definition checkout is run-scoped: the dispatch decides
+                    // whether this run gets one by attaching the clone variables,
+                    // independent of which environment the run executes in.
+                    environment::prepend_factory_definition_clone(
+                        &mut workspace.setup_commands,
+                        session_shell_type,
+                    );
+                    let cloud_env_mcp_scan = if workspace.needs_preparation() {
+                        // Subscribe to file-based MCP discovery BEFORE prepare_environment
+                        // triggers the pipeline so no CloudEnvMcpScanComplete events are
+                        // missed.
+                        //
+                        // File-based MCP discovery is Oz-only.
+                        // TODO(REMOTE-1345): handle MCP setup for third-party harnesses.
+                        match &task.harness {
+                            HarnessKind::Oz => {
+                                let source_repos = workspace.source_repos.clone();
+                                Some(
+                                    foreground
+                                        .spawn(move |me, ctx| {
+                                            let expected_repo_paths: Vec<PathBuf> = source_repos
+                                                .iter()
+                                                .map(|repo| me.working_dir.join(&repo.repo))
+                                                .collect();
+                                            me.wait_for_cloud_env_file_based_mcp_scan(
+                                                expected_repo_paths,
+                                                MCP_SERVER_STARTUP_TIMEOUT,
+                                                ctx,
+                                            )
+                                        })
+                                        .await?,
+                                )
+                            }
+                            HarnessKind::ThirdParty(_) | HarnessKind::Unsupported(_) => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let prepared = match agent_setup::prepare_workspace(
+                        &foreground,
+                        task.harness.harness(),
+                        workspace,
+                        &setup_events,
+                        environment_snapshot_reporter,
+                    )
+                    .await
+                    {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            // Preserve the terminal session when environment setup fails.
+                            Self::linger_after_failure(&foreground, "environment_setup", &error)
+                                .await;
+                            return Err(error);
+                        }
+                    };
+                    let harness_working_dir = prepared.harness_working_dir.clone();
+                    foreground
+                        .spawn(move |me, _| me.harness_working_dir = harness_working_dir)
+                        .await?;
+                    if let Some(scan) = cloud_env_mcp_scan {
+                        Self::await_file_based_mcp_startup(
+                            SetupStep::FileBasedMcpDiscovery,
+                            SetupStep::FileBasedMcpReadiness,
+                            scan,
+                            MCP_SERVER_STARTUP_TIMEOUT,
+                            &setup_events,
+                            &foreground,
+                        )
+                        .await?;
+                    }
+                    (global_skill_resolution, prepared)
                 }
             };
-            let harness_working_dir = prepared_workspace.harness_working_dir;
-            foreground
-                .spawn(move |me, _| me.harness_working_dir = harness_working_dir)
-                .await?;
-            if let Some(scan) = cloud_env_mcp_scan {
-                Self::await_file_based_mcp_startup(
-                    SetupStep::FileBasedMcpDiscovery,
-                    SetupStep::FileBasedMcpReadiness,
-                    scan,
-                    MCP_SERVER_STARTUP_TIMEOUT,
-                    &setup_events,
-                    &foreground,
-                )
-                .await?;
-            }
             if matches!(&task.harness, HarnessKind::Oz) {
                 let managed_mcp_client = foreground
                     .spawn(|_, ctx| ServerApiProvider::as_ref(ctx).get_managed_mcp_client())

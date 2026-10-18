@@ -2801,7 +2801,12 @@ fn deferred_repository_semantic_skill_publication_without_initial_inventory() {
                     }
                     let driver = app.update(|ctx| AgentDriver::create(options, ctx).unwrap());
                     let foreground = driver.update(&mut app, |driver, ctx| {
-                        assert!(driver.workspace.take().unwrap().source_repos.is_empty());
+                        let Some(super::WorkspaceState::Pending(workspace)) =
+                            driver.workspace.take()
+                        else {
+                            panic!("expected a workspace awaiting setup");
+                        };
+                        assert!(workspace.source_repos.is_empty());
                         assert_eq!(driver.factory_repository_contract, should_activate);
                         assert_eq!(
                             driver.resolved_env_vars.contains_key(std::ffi::OsStr::new(
