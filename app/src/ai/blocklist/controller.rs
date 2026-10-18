@@ -2941,6 +2941,11 @@ impl BlocklistAIController {
         self.attachments_download_dir = Some(dir);
     }
 
+    #[cfg(test)]
+    pub(crate) fn attachments_download_dir_for_test(&self) -> Option<&std::path::Path> {
+        self.attachments_download_dir.as_deref()
+    }
+
     fn start_new_conversation_for_request<'a>(
         &self,
         ctx: &'a mut ModelContext<Self>,

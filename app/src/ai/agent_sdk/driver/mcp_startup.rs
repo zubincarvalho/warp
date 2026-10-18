@@ -22,7 +22,7 @@ use warp_server_client::base_client::AMBIENT_WORKLOAD_TOKEN_HEADER;
 use warpui::r#async::{FutureExt as _, TimeoutError};
 use warpui::{Entity, ModelContext, ModelHandle, ModelSpawner, SingletonEntity};
 
-use super::{AgentDriver, AgentDriverError, sandbox_deadline};
+use super::{AgentDriver, AgentDriverError};
 use crate::ai::agent_sdk::retry::{is_transient_graphql_or_http_error, with_bounded_retry_using};
 use crate::ai::agent_sdk::setup_observability::{SetupClientEventReporter, SetupStep};
 use crate::ai::ambient_agents::AmbientAgentTaskId;
@@ -226,7 +226,11 @@ async fn builtin_mcp_ambient_headers(
     else {
         return Vec::new();
     };
-    let must_outlive = sandbox_deadline().map(DateTime::<Utc>::from);
+    let must_outlive = foreground
+        .spawn(|me, _| me.sandbox_deadline.map(DateTime::<Utc>::from))
+        .await
+        .ok()
+        .flatten();
     server_api
         .pinned_ambient_agent_headers_for_task(&task_id, must_outlive)
         .await
@@ -562,6 +566,50 @@ fn wait_for_mcp_servers_started(
 }
 
 impl AgentDriver {
+    pub(super) async fn replace_prewarmed_mcp_environment(
+        foreground: &ModelSpawner<Self>,
+        environment: HashMap<String, String>,
+    ) -> Result<(), AgentDriverError> {
+        let (retained, stopped) = foreground
+            .spawn(move |_, ctx| {
+                TemplatableMCPServerManager::handle(ctx).update(ctx, |manager, ctx| {
+                    manager.replace_runtime_environment(environment, ctx)
+                })
+            })
+            .await?;
+        futures::future::join_all(stopped)
+            .with_timeout(MCP_SERVER_STARTUP_TIMEOUT)
+            .await
+            .map_err(|_| {
+                AgentDriverError::ConfigBuildFailed(anyhow::anyhow!(
+                    "Standby MCP shutdown timed out"
+                ))
+            })?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| AgentDriverError::InvalidRuntimeState)?;
+        foreground
+            .spawn(move |me, ctx| {
+                let names = retained
+                    .iter()
+                    .map(|installation| {
+                        (
+                            installation.uuid(),
+                            installation.templatable_mcp_server().name.clone(),
+                        )
+                    })
+                    .collect();
+                let wait = wait_for_mcp_servers_started(me, names, ctx);
+                TemplatableMCPServerManager::handle(ctx).update(ctx, |manager, ctx| {
+                    for installation in retained {
+                        manager.spawn_ephemeral_server(installation, ctx);
+                    }
+                });
+                wait
+            })
+            .await?
+            .await
+    }
     /// Resolve MCP specs into a map of MCP name to `JSONMCPServer` for use in
     /// third-party harnesses. Each spec is fully resolved (secrets applied, templates
     /// rendered) so harnesses can serialize directly into their native config format.

@@ -49,6 +49,7 @@ use crate::ai::agent_sdk::driver::harness::{
     task_env_vars,
 };
 use crate::ai::agent_sdk::environment_snapshot::EnvironmentSnapshotReporter;
+use crate::ai::agent_sdk::execution_config;
 use crate::ai::agent_sdk::setup_observability::{
     OzRunTimelineEvent, SetupClientEventReporter, SetupStep,
 };
@@ -75,6 +76,7 @@ use crate::ai::document::ai_document_model::{AIDocumentModel, AIDocumentModelEve
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::auth::AuthStateProvider;
+use crate::auth::credentials::Credentials;
 use crate::cloud_object::{CloudObject, CloudObjectLookup as _};
 use crate::send_telemetry_from_app_ctx;
 use crate::server::ids::{ServerId, SyncId};
@@ -83,6 +85,7 @@ use crate::server::server_api::ai::{AIClient, TaskGitCredentialsError, TaskStatu
 use crate::server::server_api::harness_support::{
     HarnessSupportClient, ResolvePromptAttachedSkill, ResolvePromptRequest,
 };
+use crate::server::server_api::managed_secrets::AppManagedSecretManager as ManagedSecretManager;
 use crate::server::team_scope::RequestTeamScope;
 use crate::terminal::ShellLaunchData;
 use crate::terminal::cli_agent_sessions::plugin_manager::{
@@ -114,6 +117,7 @@ pub(crate) mod harness;
 mod harness_output_monitor;
 pub(crate) mod mcp_startup;
 pub(super) mod output;
+mod prewarmed;
 mod snapshot;
 pub(crate) mod terminal;
 mod termination;
@@ -1026,6 +1030,7 @@ pub struct AgentDriver {
     /// How long to wait for MCP servers to start before degrading (or failing,
     /// in strict mode).
     mcp_startup_timeout: Duration,
+    sandbox_deadline: Option<SystemTime>,
 }
 
 #[derive(Clone)]
@@ -1453,6 +1458,7 @@ impl AgentDriver {
             skip_initial_turn: false,
             strict_mcp_startup: false,
             mcp_startup_timeout: MCP_SERVER_STARTUP_TIMEOUT,
+            sandbox_deadline: sandbox_deadline(),
         }
     }
 
@@ -1643,14 +1649,17 @@ impl AgentDriver {
         /// How far before the sandbox deadline to start the teardown sequence.
         const SHUTDOWN_WARNING_WINDOW: Duration = Duration::from_secs(5 * 60);
 
-        let maybe_wait = sandbox_deadline().and_then(|deadline| {
-            let warning_at = deadline.checked_sub(SHUTDOWN_WARNING_WINDOW)?;
-            match warning_at.duration_since(SystemTime::now()) {
-                Ok(wait) => Some(wait),
-                // Already inside the warning window — trigger immediately.
-                Err(_) => Some(Duration::ZERO),
-            }
-        });
+        let maybe_wait = foreground
+            .spawn(|me, _| me.sandbox_deadline)
+            .await?
+            .and_then(|deadline| {
+                let warning_at = deadline.checked_sub(SHUTDOWN_WARNING_WINDOW)?;
+                match warning_at.duration_since(SystemTime::now()) {
+                    Ok(wait) => Some(wait),
+                    // Already inside the warning window — trigger immediately.
+                    Err(_) => Some(Duration::ZERO),
+                }
+            });
 
         // Resolved before waiting because everything after the timer fires competes with the
         // shutdown window. Billing metadata is already loaded by then — cloud runs block on
