@@ -102,7 +102,7 @@ fn paired_execution_launch_keeps_inventory_separate_from_eager_membership() {
             .unwrap();
             let (options, _, _, _) = app.update(|ctx| {
                 super::build_execution_task_and_options(
-                    &args,
+                    Some(&args),
                     config,
                     super::RepositoryContract {
                         supports_deferred_repositories,
@@ -196,7 +196,7 @@ fn paired_execution_rejects_a_different_task_or_execution() {
             .unwrap();
             let result = app.update(|ctx| {
                 super::build_execution_task_and_options(
-                    &args,
+                    Some(&args),
                     config,
                     super::RepositoryContract {
                         supports_deferred_repositories: true,
