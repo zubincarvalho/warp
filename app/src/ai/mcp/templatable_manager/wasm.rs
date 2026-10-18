@@ -12,6 +12,17 @@ use crate::server::cloud_objects::update_manager::InitiatedBy;
 use crate::server::ids::ServerId;
 
 impl TemplatableMCPServerManager {
+    pub(crate) fn replace_runtime_environment(
+        &mut self,
+        environment: HashMap<String, String>,
+        _: &mut ModelContext<Self>,
+    ) -> (
+        Vec<TemplatableMCPServerInstallation>,
+        Vec<futures::channel::oneshot::Receiver<()>>,
+    ) {
+        self.runtime_environment = environment;
+        (Vec::new(), Vec::new())
+    }
     /// Creates a new [`TemplatableMCPServerManager`] instance.
     pub fn new(
         _locally_installed_servers: HashMap<Uuid, TemplatableMCPServerInstallation>,
@@ -108,6 +119,14 @@ impl TemplatableMCPServerManager {
         _ctx: &mut ModelContext<Self>,
     ) {
         log::warn!("Ephemeral MCP server spawning not supported in WASM");
+    }
+
+    pub fn spawn_ephemeral_server(
+        &mut self,
+        installation: TemplatableMCPServerInstallation,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.spawn_cli_ephemeral_server(installation, ctx);
     }
 
     /// Shuts down a running MCP server.
