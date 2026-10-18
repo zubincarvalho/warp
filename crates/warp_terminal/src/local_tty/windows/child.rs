@@ -2,9 +2,9 @@ use std::ffi::c_void;
 
 use mio::event::Source;
 use mio::{Interest, Registry, Token};
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::Threading::{
-    INFINITE, RegisterWaitForSingleObject, UnregisterWait, WT_EXECUTEINWAITTHREAD,
+    INFINITE, RegisterWaitForSingleObject, UnregisterWaitEx, WT_EXECUTEINWAITTHREAD,
     WT_EXECUTEONLYONCE,
 };
 
@@ -18,9 +18,7 @@ struct ChildExitSender {
 
 /// WinAPI callback to run when child process exits.
 extern "system" fn child_exit_callback(ctx: *mut c_void, timed_out: bool) {
-    // Convert context back into a Box<ChildExitSender>.  We do this immediately
-    // to ensure it doesn't get leaked if we hit the timeout.
-    let event_tx = unsafe { Box::from_raw(ctx as *mut ChildExitSender) };
+    let event_tx = unsafe { &*ctx.cast::<ChildExitSender>() };
 
     // This will not be hit by our current invocation strategy, as we
     // call RegisterWaitForSingleObject with both a timeout of INFINITE
@@ -35,6 +33,7 @@ extern "system" fn child_exit_callback(ctx: *mut c_void, timed_out: bool) {
 
 pub(super) struct ChildExitWatcher {
     wait_handle: ShareableHandle,
+    _sender: Box<ChildExitSender>,
 }
 
 // Mark `ChildExitWatcher` as being safe to share between threads,
@@ -49,7 +48,7 @@ impl ChildExitWatcher {
         event_loop_tx: mio_channel::Sender<Message>,
     ) -> windows::core::Result<ChildExitWatcher> {
         let mut wait_handle = HANDLE::default();
-        let sender_ref = Box::new(ChildExitSender {
+        let mut sender = Box::new(ChildExitSender {
             sender: event_loop_tx,
         });
 
@@ -58,7 +57,7 @@ impl ChildExitWatcher {
                 &mut wait_handle,
                 child_handle,
                 Some(child_exit_callback),
-                Some(Box::into_raw(sender_ref).cast()),
+                Some((&mut *sender as *mut ChildExitSender).cast()),
                 INFINITE,
                 WT_EXECUTEINWAITTHREAD | WT_EXECUTEONLYONCE,
             )?
@@ -66,6 +65,7 @@ impl ChildExitWatcher {
 
         Ok(ChildExitWatcher {
             wait_handle: ShareableHandle(wait_handle),
+            _sender: sender,
         })
     }
 }
@@ -100,7 +100,8 @@ impl Source for ChildExitWatcher {
 impl Drop for ChildExitWatcher {
     fn drop(&mut self) {
         unsafe {
-            let _ = UnregisterWait(self.wait_handle.0);
+            // A replacement must not receive the previous process's delayed exit notification.
+            let _ = UnregisterWaitEx(self.wait_handle.0, Some(INVALID_HANDLE_VALUE));
         }
     }
 }

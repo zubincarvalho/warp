@@ -3,6 +3,15 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
+fn docker_sandbox_replacement_is_unsupported() {
+    let starter = ShellStarter::DockerSandbox(DockerSandboxShellStarter::new(
+        DirectShellStarter::new_for_test(ShellType::Bash, "sbx".into(), Vec::new()),
+        None,
+    ));
+    assert!(starter.replacement().is_none());
+}
+
+#[test]
 fn direct_replacement_refreshes_embedded_bootstrap_session() {
     let starter = ShellStarter::Direct(DirectShellStarter {
         shell_type: ShellType::Bash,
