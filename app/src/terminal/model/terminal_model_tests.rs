@@ -56,6 +56,54 @@ fn create_default_serialized_block() -> SerializedBlock {
     }
 }
 
+#[test]
+fn planned_shell_replacement_does_not_require_shared_session_or_ai_action() {
+    let _respawn_disabled = FeatureFlag::CloudAgentShellRespawn.override_enabled(false);
+    let mut terminal = TerminalModel::mock(None, None);
+    assert!(!terminal.is_shared_ambient_agent_session());
+    assert!(
+        terminal
+            .block_list()
+            .active_block()
+            .requested_command_action_id()
+            .is_none()
+    );
+    terminal.prepare_shell_replacement();
+    let session_id = 456.into();
+    terminal.register_session_id(session_id);
+    terminal.init_shell(InitShellValue {
+        session_id,
+        shell: "bash".into(),
+        ..Default::default()
+    });
+    terminal.finish_shell_replacement(true);
+    assert_eq!(terminal.pending_session_id(), Some(session_id));
+    assert!(!terminal.is_read_only());
+    assert!(terminal.pending_shell_recovery_status.is_none());
+}
+
+#[test]
+fn planned_shell_exit_is_deferred_without_recovery_feature() {
+    let _respawn_disabled = FeatureFlag::CloudAgentShellRespawn.override_enabled(false);
+    let mut terminal = TerminalModel::mock(None, None);
+    let (events_tx, events_rx) = async_channel::unbounded();
+    terminal.event_proxy = ChannelEventListener::builder_for_test()
+        .with_terminal_events_tx(events_tx)
+        .build();
+    terminal.prepare_shell_replacement();
+    terminal.exit(ExitReason::ShellProcessExited {
+        status: ObservedExitStatus::Code(1),
+    });
+    assert!(matches!(
+        events_rx.try_recv(),
+        Ok(Event::ShellExitObserved { .. })
+    ));
+    assert!(events_rx.try_recv().is_err());
+    terminal.finish_shell_replacement(false);
+    assert!(terminal.is_read_only());
+    assert!(events_rx.try_recv().is_err());
+}
+
 fn report_shell_typeahead(model: &mut TerminalModel, text: &str) {
     model.input_buffer(InputBufferValue {
         buffer: text.to_owned(),

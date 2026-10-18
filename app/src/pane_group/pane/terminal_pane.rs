@@ -921,6 +921,48 @@ fn handle_terminal_view_event(
             Event::ExecuteCommand(event) => {
                 ctx.emit(pane_group::Event::ExecuteCommand(event.clone()));
             }
+            Event::ReplaceShell(request) => {
+                let terminal_manager = group.terminal_session_by_id(pane_id).and_then(|pane| {
+                    pane.view
+                        .as_ref(ctx)
+                        .pane_stack()
+                        .as_ref(ctx)
+                        .entries()
+                        .iter()
+                        .find(|(_, view)| view.id() == terminal_view.id())
+                        .map(|(manager, _)| manager.clone())
+                });
+                let result = terminal_manager
+                    .ok_or_else(|| anyhow::anyhow!("terminal manager is unavailable"))
+                    .and_then(|manager| {
+                        manager.update(ctx, |manager, ctx| {
+                            manager.replace_shell(request.clone(), ctx)
+                        })
+                    });
+                if let Err(error) = result
+                    && let Some(terminal_view) = terminal_view.upgrade(ctx)
+                {
+                    terminal_view.update(ctx, |view, ctx| {
+                        view.on_shell_replaced(request.id, Err(error), ctx);
+                    });
+                }
+            }
+            Event::CancelShellReplacement(request_id) => {
+                if let Some(manager) = group.terminal_session_by_id(pane_id).and_then(|pane| {
+                    pane.view
+                        .as_ref(ctx)
+                        .pane_stack()
+                        .as_ref(ctx)
+                        .entries()
+                        .iter()
+                        .find(|(_, view)| view.id() == terminal_view.id())
+                        .map(|(manager, _)| manager.clone())
+                }) {
+                    manager.update(ctx, |manager, _| {
+                        manager.cancel_shell_replacement(*request_id)
+                    });
+                }
+            }
             Event::RecoverCloudShell(request) => {
                 let terminal_manager = group.terminal_session_by_id(pane_id).and_then(|pane| {
                     pane.view
