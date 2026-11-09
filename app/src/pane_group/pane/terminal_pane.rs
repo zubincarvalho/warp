@@ -609,7 +609,7 @@ impl PaneContent for TerminalPane {
                     Ok(ShareableLink::Pane { url })
                 } else {
                     Err(ShareableLinkError::Unexpected(String::from(
-                        "Failed to retreive shared session link",
+                        "Failed to retrieve shared session link",
                     )))
                 }
             }
